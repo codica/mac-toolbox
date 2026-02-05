@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mac-toolbox"
+version = "0.1.0"
+description = "Mac 个人工具箱"
+requires-python = ">=3.10"
+
+[project.scripts]
+mt = "mac_toolbox.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mac_toolbox*"]
