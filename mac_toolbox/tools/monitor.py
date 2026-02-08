@@ -25,13 +25,14 @@ DAEMON_LOG = DATA_DIR / "monitor.out"
 # ── log stream 配置 ──────────────────────────────────────────
 
 LOG_PREDICATE = (
-    '(process == "loginwindow" AND eventMessage CONTAINS "unlock") '
-    'OR (process == "loginwindow" AND eventMessage CONTAINS "lock") '
+    '(process == "loginwindow" AND eventMessage CONTAINS[c] "lock") '
     'OR (process == "authd" AND subsystem == "com.apple.Authorization") '
     'OR (process == "opendirectoryd" AND eventMessage CONTAINS "authentication") '
     'OR (process == "coreauthd" AND subsystem == "com.apple.localauthentication")'
 )
 
+# Pattern matching rules: (process, keyword, event_type)
+# Order matters — more specific patterns first
 PATTERNS = [
     ("opendirectoryd", "Failed SecureToken authentication", "auth_fail_password"),
     ("opendirectoryd", "failed to authenticate", "auth_fail_password"),
@@ -48,7 +49,7 @@ PATTERNS = [
 
 FAIL_EVENTS = {"auth_fail_password", "auth_fail_touchid"}
 SUCCESS_EVENTS = {"auth_success_password", "auth_success_touchid", "screen_unlocked"}
-PHOTO_DELAY = 5
+PHOTO_DELAY = 5  # 失败后等几秒，确认没有成功事件再拍照
 
 # ── ANSI colors ──────────────────────────────────────────────
 
@@ -135,6 +136,7 @@ def _write_event(event_type: str, detail: str, photo: str | None = None):
 
 
 def _parse_log_line(line: str) -> tuple[str, str] | None:
+    """Parse a log stream line and return (process, message) or None."""
     line = line.strip()
     if not line or line.startswith("Filtering") or line.startswith("Timestamp"):
         return None
@@ -150,6 +152,7 @@ def _parse_log_line(line: str) -> tuple[str, str] | None:
 
 
 def _classify_event(process: str, message: str) -> tuple[str, str] | None:
+    """Match a log line against known patterns. Returns (event_type, detail) or None."""
     for pat_process, keyword, event_type in PATTERNS:
         if process == pat_process and keyword.lower() in message.lower():
             return (event_type, keyword)
@@ -157,6 +160,7 @@ def _classify_event(process: str, message: str) -> tuple[str, str] | None:
 
 
 def _find_monitor_pids() -> list[int]:
+    """Find all running monitor and its child log stream PIDs via pgrep."""
     pids = []
     my_pid = os.getpid()
     for pattern in ("mac_toolbox.*monitor", "log stream.*loginwindow"):
@@ -177,6 +181,7 @@ def _find_monitor_pids() -> list[int]:
 # ── start ────────────────────────────────────────────────────
 
 def _start_monitor():
+    """Start the log stream monitor loop."""
     global _running
     _running = True
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -202,27 +207,30 @@ def _start_monitor():
 
     import select
 
-    seen_events = set()
-    pending_capture = False
-    pending_capture_time = 0.0
-    auth_succeeded = False
+    seen_events = set()  # simple dedup
+    screen_locked = True  # 默认 True，启动时可能已在锁屏；后续由事件驱动
+    pending_capture = False  # 是否有待拍照的失败事件
+    pending_capture_time = 0.0  # 首次失败的时间
+    auth_succeeded = False  # 延迟窗口内是否出现过成功事件
 
     try:
         while _running and proc.poll() is None:
+            # 检查延迟拍照：到时间了就决定拍不拍
             if pending_capture and time.time() - pending_capture_time >= PHOTO_DELAY:
                 if not auth_succeeded:
                     photo_path = _capture_photo()
                     if photo_path:
                         _write_event("auth_fail_password", "Failed authentication (photo)", photo_path)
                 else:
-                    print(f"  [skip photo] auth succeeded within {PHOTO_DELAY}s")
+                    print(f"  [skip photo] auth succeeded within {PHOTO_DELAY}s, not a real failure")
                 pending_capture = False
                 auth_succeeded = False
 
+            # select: 有待拍照时最多等到 deadline，否则无限等待新数据
             if pending_capture:
                 timeout = max(0, pending_capture_time + PHOTO_DELAY - time.time())
             else:
-                timeout = None
+                timeout = None  # 无限等待，完全不耗 CPU
 
             ready, _, _ = select.select([proc.stdout], [], [], timeout)
             if not ready:
@@ -243,6 +251,7 @@ def _start_monitor():
 
             event_type, detail = result
 
+            # Simple dedup: skip identical events within same second
             dedup_key = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:{event_type}"
             if dedup_key in seen_events:
                 continue
@@ -250,8 +259,21 @@ def _start_monitor():
             if len(seen_events) > 1000:
                 seen_events.clear()
 
+            # 跟踪锁屏状态
+            if event_type == "screen_locked":
+                screen_locked = True
+            elif event_type == "screen_unlocked":
+                screen_locked = False
+
+            # 成功事件：标记，取消待拍照
             if event_type in SUCCESS_EVENTS:
                 auth_succeeded = True
+
+            # 非锁屏期间的认证失败 = 系统内部行为（Dark Wake 等），跳过
+            if event_type in FAIL_EVENTS and not screen_locked:
+                continue
+
+            # 失败事件：标记待拍照（延迟执行）
             if event_type in FAIL_EVENTS and not pending_capture:
                 pending_capture = True
                 pending_capture_time = time.time()
@@ -271,6 +293,7 @@ def _start_monitor():
 
 
 def _daemonize():
+    """Fork into background using nohup-style double fork."""
     _ensure_data_dir()
 
     old_pids = _find_monitor_pids()
@@ -310,6 +333,7 @@ def _daemonize():
 # ── stop ─────────────────────────────────────────────────────
 
 def _stop_monitor():
+    """Stop all running monitor daemons and their child log stream processes."""
     pids = _find_monitor_pids()
 
     if PID_FILE.exists():
