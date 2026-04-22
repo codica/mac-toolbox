@@ -580,6 +580,74 @@ def _run_report(args):
     _print_report(events, title)
 
 
+# ── LaunchDaemon install/uninstall ───────────────────────────
+
+PLIST_LABEL = "com.mac-toolbox.monitor"
+PLIST_PATH = Path(f"/Library/LaunchDaemons/{PLIST_LABEL}.plist")
+
+
+def _mt_executable() -> str:
+    """返回当前 mt 可执行文件的绝对路径。"""
+    import shutil
+    path = shutil.which("mt")
+    if path:
+        return path
+    # fallback: 与当前 Python 同目录
+    return str(Path(sys.executable).parent / "mt")
+
+
+def _install_launchdaemon():
+    mt = _mt_executable()
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{mt}</string>
+        <string>monitor</string>
+        <string>start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{DATA_DIR}/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>{DATA_DIR}/launchd.err</string>
+</dict>
+</plist>
+"""
+    if os.geteuid() != 0:
+        print("Error: install 需要 sudo 权限。", file=sys.stderr)
+        sys.exit(1)
+
+    _ensure_data_dir()
+    PLIST_PATH.write_text(plist)
+    PLIST_PATH.chmod(0o644)
+
+    subprocess.run(["launchctl", "load", "-w", str(PLIST_PATH)], check=True)
+    print(f"已安装并启动 LaunchDaemon: {PLIST_PATH}")
+    print(f"日志: {DATA_DIR}/launchd.out")
+    print("开机将自动运行，无需 sudo mt monitor start。")
+
+
+def _uninstall_launchdaemon():
+    if os.geteuid() != 0:
+        print("Error: uninstall 需要 sudo 权限。", file=sys.stderr)
+        sys.exit(1)
+
+    if PLIST_PATH.exists():
+        subprocess.run(["launchctl", "unload", "-w", str(PLIST_PATH)], check=False)
+        PLIST_PATH.unlink()
+        print(f"已移除 LaunchDaemon: {PLIST_PATH}")
+    else:
+        print("未找到已安装的 LaunchDaemon。")
+
+
 # ── CLI 注册 ─────────────────────────────────────────────────
 
 def register(subparsers):
@@ -596,6 +664,14 @@ def register(subparsers):
     # mt monitor stop
     stop_p = sp.add_parser("stop", help="停止守护进程")
     stop_p.set_defaults(func=_run_stop)
+
+    # mt monitor install
+    install_p = sp.add_parser("install", help="安装为开机自启 LaunchDaemon（需要 sudo）")
+    install_p.set_defaults(func=lambda args: _install_launchdaemon())
+
+    # mt monitor uninstall
+    uninstall_p = sp.add_parser("uninstall", help="移除开机自启 LaunchDaemon（需要 sudo）")
+    uninstall_p.set_defaults(func=lambda args: _uninstall_launchdaemon())
 
     # mt monitor report
     report_p = sp.add_parser("report", help="查看认证事件报告")

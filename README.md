@@ -33,6 +33,10 @@ sudo mt monitor stop                     # 停止守护进程
 mt monitor report                        # 今日报告
 mt monitor report --days 7               # 最近 7 天
 mt monitor report --all                  # 全部记录
+
+# 开机自启
+sudo mt monitor install                  # 安装为 LaunchDaemon，开机自动运行
+sudo mt monitor uninstall                # 移除开机自启
 ```
 
 #### 监控的系统事件
