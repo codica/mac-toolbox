@@ -12,11 +12,14 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
+import urllib.parse
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
 DATA_DIR = Path.home() / ".mac-toolbox" / "monitor"
+CONFIG_FILE = Path.home() / ".mac-toolbox" / "config.json"
 LOG_FILE = DATA_DIR / "auth_events.log"
 CAPTURE_DIR = DATA_DIR / "captures"
 PID_FILE = DATA_DIR / "monitor.pid"
@@ -28,7 +31,8 @@ LOG_PREDICATE = (
     '(process == "loginwindow" AND eventMessage CONTAINS[c] "lock") '
     'OR (process == "authd" AND subsystem == "com.apple.Authorization") '
     'OR (process == "opendirectoryd" AND eventMessage CONTAINS "authentication") '
-    'OR (process == "coreauthd" AND subsystem == "com.apple.localauthentication")'
+    'OR (process == "coreauthd" AND subsystem == "com.apple.localauthentication") '
+    'OR (process == "powerd" AND (eventMessage CONTAINS "kIOMessageSystemHasPoweredOn" OR eventMessage CONTAINS "kIOMessageSystemWillSleep"))'
 )
 
 # Pattern matching rules: (process, keyword, event_type)
@@ -45,6 +49,8 @@ PATTERNS = [
     ("loginwindow", "sendScreenUnlockedNotification", "screen_unlocked"),
     ("loginwindow", "enqueueScreenLockRequest", "screen_locked"),
     ("loginwindow", "CGSSessionScreenIsLocked: isLocked", "screen_locked"),
+    ("powerd", "kIOMessageSystemHasPoweredOn", "system_wake"),
+    ("powerd", "kIOMessageSystemWillSleep", "system_sleep"),
 ]
 
 FAIL_EVENTS = {"auth_fail_password", "auth_fail_touchid"}
@@ -68,7 +74,67 @@ EVENT_LABELS = {
     "auth_fail_password": ("密码失败", RED),
     "auth_success_touchid": ("Touch ID 成功", GREEN),
     "auth_fail_touchid": ("Touch ID 失败", RED),
+    "system_sleep": ("进入休眠", DIM),
+    "system_wake": ("从休眠恢复", CYAN),
 }
+
+# ── Telegram ─────────────────────────────────────────────────
+
+def _load_telegram_config() -> tuple[str, str] | tuple[None, None]:
+    """从 ~/.mac-toolbox/config.json 读取 telegram.token 和 telegram.chat_id。"""
+    if not CONFIG_FILE.exists():
+        return None, None
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+        tg = cfg.get("telegram", {})
+        return tg.get("token"), tg.get("chat_id")
+    except Exception:
+        return None, None
+
+
+def _send_telegram(message: str):
+    """非阻塞地发送 Telegram 消息，失败只打印警告，不影响主流程。"""
+    token, chat_id = _load_telegram_config()
+    if not token or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        print(f"  [Telegram] 发送失败: {e}")
+
+
+_last_unlock_notify: float = 0.0     # 上次发送解锁通知的时间
+_last_wake_notify: float = 0.0       # 上次发送唤醒通知的时间
+EVENT_NOTIFY_COOLDOWN = 60           # 解锁/唤醒通知最短间隔（秒）
+
+def _notify_telegram(event_type: str, detail: str):
+    """根据事件类型决定是否发送 Telegram 通知。"""
+    global _last_unlock_notify, _last_wake_notify
+    now_ts = time.time()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hostname = os.uname().nodename
+
+    if event_type in FAIL_EVENTS:
+        pass  # 认证失败事件不发通知（噪音过多）
+
+    elif event_type == "screen_unlocked":
+        if now_ts - _last_unlock_notify >= EVENT_NOTIFY_COOLDOWN:
+            _last_unlock_notify = now_ts
+            _send_telegram(f"🔓 <b>[{hostname}] 屏幕已解锁</b>\n🕐 {now_str}")
+
+    elif event_type == "system_wake":
+        if now_ts - _last_wake_notify >= EVENT_NOTIFY_COOLDOWN:
+            _last_wake_notify = now_ts
+            _send_telegram(f"💻 <b>[{hostname}] 从休眠恢复</b>\n🕐 {now_str}")
+
 
 # ── 全局状态 ─────────────────────────────────────────────────
 
@@ -142,7 +208,7 @@ def _parse_log_line(line: str) -> tuple[str, str] | None:
         return None
 
     process = None
-    for proc_name in ("loginwindow", "authd", "opendirectoryd", "coreauthd"):
+    for proc_name in ("loginwindow", "authd", "opendirectoryd", "coreauthd", "powerd"):
         if proc_name in line:
             process = proc_name
             break
@@ -194,7 +260,7 @@ def _start_monitor():
     print(f"Log file: {LOG_FILE}")
     print("Listening for authentication events... (Ctrl+C to stop)")
 
-    cmd = ["log", "stream", "--predicate", LOG_PREDICATE, "--style", "compact"]
+    cmd = ["log", "stream", "--predicate", LOG_PREDICATE, "--style", "compact", "--level", "debug"]
 
     try:
         proc = subprocess.Popen(
@@ -260,7 +326,7 @@ def _start_monitor():
                 seen_events.clear()
 
             # 跟踪锁屏状态
-            if event_type == "screen_locked":
+            if event_type in ("screen_locked", "system_wake"):
                 screen_locked = True
             elif event_type == "screen_unlocked":
                 screen_locked = False
@@ -280,6 +346,7 @@ def _start_monitor():
                 auth_succeeded = False
 
             _write_event(event_type, detail)
+            _notify_telegram(event_type, detail)
 
     finally:
         proc.terminate()
