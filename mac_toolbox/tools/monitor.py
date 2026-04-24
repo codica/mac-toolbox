@@ -8,9 +8,11 @@
 
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -28,7 +30,7 @@ DAEMON_LOG = DATA_DIR / "monitor.out"
 # ── log stream 配置 ──────────────────────────────────────────
 
 LOG_PREDICATE = (
-    '(process == "loginwindow" AND eventMessage CONTAINS[c] "lock") '
+    '(process == "loginwindow" AND (eventMessage CONTAINS[c] "lock" OR eventMessage CONTAINS "sclk")) '
     'OR (process == "authd" AND subsystem == "com.apple.Authorization") '
     'OR (process == "opendirectoryd" AND eventMessage CONTAINS "authentication") '
     'OR (process == "coreauthd" AND subsystem == "com.apple.localauthentication") '
@@ -49,6 +51,8 @@ PATTERNS = [
     ("loginwindow", "sendScreenUnlockedNotification", "screen_unlocked"),
     ("loginwindow", "enqueueScreenLockRequest", "screen_locked"),
     ("loginwindow", "CGSSessionScreenIsLocked: isLocked", "screen_locked"),
+    ("loginwindow", "aevt,sclk", "screen_locked"),
+    ("loginwindow", "aevt/sclk", "screen_locked"),
     ("powerd", "kIOMessageSystemHasPoweredOn", "system_wake"),
     ("powerd", "kIOMessageSystemWillSleep", "system_sleep"),
 ]
@@ -92,32 +96,61 @@ def _load_telegram_config() -> tuple[str, str] | tuple[None, None]:
         return None, None
 
 
-def _send_telegram(message: str):
-    """非阻塞地发送 Telegram 消息，失败只打印警告，不影响主流程。"""
+_tg_queue: "queue.Queue[str]" = queue.Queue()
+_tg_worker_lock = threading.Lock()
+_tg_worker_started = False
+
+
+def _tg_worker_loop():
+    """单工作线程串行发送，保证消息按入队顺序到达 Telegram。"""
     token, chat_id = _load_telegram_config()
     if not token or not chat_id:
         return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    while True:
+        message = _tg_queue.get()
         data = urllib.parse.urlencode({
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML",
         }).encode()
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-    except Exception as e:
-        print(f"  [Telegram] 发送失败: {e}")
+        last_err = None
+        for delay in (0, 2, 5, 10):
+            if delay:
+                time.sleep(delay)
+            try:
+                req = urllib.request.Request(url, data=data, method="POST")
+                with urllib.request.urlopen(req, timeout=10):
+                    last_err = None
+                    break
+            except Exception as e:
+                last_err = e
+        if last_err:
+            print(f"  [Telegram] 发送失败（已重试 4 次）: {last_err}")
+        _tg_queue.task_done()
+
+
+def _send_telegram(message: str):
+    """入队待发送的 Telegram 消息（按入队顺序串行发送，含重试）。"""
+    global _tg_worker_started
+    token, chat_id = _load_telegram_config()
+    if not token or not chat_id:
+        return
+    with _tg_worker_lock:
+        if not _tg_worker_started:
+            threading.Thread(target=_tg_worker_loop, daemon=True).start()
+            _tg_worker_started = True
+    _tg_queue.put(message)
 
 
 _last_unlock_notify: float = 0.0     # 上次发送解锁通知的时间
+_last_lock_notify: float = 0.0       # 上次发送锁屏通知的时间
 _last_wake_notify: float = 0.0       # 上次发送唤醒通知的时间
-EVENT_NOTIFY_COOLDOWN = 60           # 解锁/唤醒通知最短间隔（秒）
+EVENT_NOTIFY_COOLDOWN = 60           # 锁屏/解锁/唤醒通知最短间隔（秒）
 
 def _notify_telegram(event_type: str, detail: str):
     """根据事件类型决定是否发送 Telegram 通知。"""
-    global _last_unlock_notify, _last_wake_notify
+    global _last_unlock_notify, _last_lock_notify, _last_wake_notify
     now_ts = time.time()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hostname = os.uname().nodename
@@ -129,6 +162,11 @@ def _notify_telegram(event_type: str, detail: str):
         if now_ts - _last_unlock_notify >= EVENT_NOTIFY_COOLDOWN:
             _last_unlock_notify = now_ts
             _send_telegram(f"🔓 <b>[{hostname}] 屏幕已解锁</b>\n🕐 {now_str}")
+
+    elif event_type == "screen_locked":
+        if now_ts - _last_lock_notify >= EVENT_NOTIFY_COOLDOWN:
+            _last_lock_notify = now_ts
+            _send_telegram(f"🔒 <b>[{hostname}] 屏幕已锁定</b>\n🕐 {now_str}")
 
     elif event_type == "system_wake":
         if now_ts - _last_wake_notify >= EVENT_NOTIFY_COOLDOWN:
