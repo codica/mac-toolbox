@@ -143,6 +143,110 @@ def _send_telegram(message: str):
     _tg_queue.put(message)
 
 
+# ── Telegram 命令长轮询 ──────────────────────────────────────
+
+def _lock_screen() -> tuple[bool, str]:
+    """通过 launchctl asuser 在当前控制台用户会话执行锁屏快捷键。"""
+    try:
+        r = subprocess.run(
+            ["stat", "-f", "%u", "/dev/console"],
+            capture_output=True, text=True, timeout=5,
+        )
+        uid = r.stdout.strip()
+        if not uid.isdigit():
+            return False, f"无法获取控制台用户 UID: {r.stdout!r}"
+        r = subprocess.run(
+            [
+                "launchctl", "asuser", uid,
+                "osascript", "-e",
+                'tell application "System Events" to keystroke "q" using {command down, control down}',
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return True, "已锁屏"
+        return False, f"osascript 退出码 {r.returncode}: {r.stderr.strip()[:200]}"
+    except Exception as e:
+        return False, f"异常: {e}"
+
+
+COMMANDS = {
+    "/lock": _lock_screen,
+}
+
+_tg_poll_started = False
+_tg_poll_lock = threading.Lock()
+
+
+def _tg_poll_loop():
+    """长轮询 getUpdates，处理白名单 chat_id 发来的命令。"""
+    token, chat_id = _load_telegram_config()
+    if not token or not chat_id:
+        return
+    chat_id_str = str(chat_id)
+    base = f"https://api.telegram.org/bot{token}/getUpdates"
+
+    def call(offset=None, timeout=30):
+        params = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+        url = base + "?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(url, timeout=timeout + 10) as resp:
+            return json.loads(resp.read())
+
+    # 启动时排空积压更新，避免执行历史命令
+    offset = None
+    try:
+        r = call(offset=-1, timeout=0)
+        if r.get("ok") and r.get("result"):
+            offset = r["result"][-1]["update_id"] + 1
+    except Exception as e:
+        print(f"  [Telegram] 排空积压失败: {e}")
+
+    while True:
+        try:
+            r = call(offset=offset, timeout=30)
+            if not r.get("ok"):
+                time.sleep(5)
+                continue
+            for upd in r.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or upd.get("channel_post") or {}
+                src = str(msg.get("chat", {}).get("id", ""))
+                if src != chat_id_str:
+                    print(f"  [Telegram] 拒绝非授权 chat_id: {src}")
+                    continue
+                text = (msg.get("text") or "").strip()
+                if not text:
+                    continue
+                cmd = text.split()[0].split("@", 1)[0].lower()
+                handler = COMMANDS.get(cmd)
+                if not handler:
+                    continue
+                user = msg.get("from", {}).get("username") or msg.get("from", {}).get("first_name", "?")
+                print(f"  [Telegram] 收到命令 {cmd} from @{user}")
+                ok, detail = handler()
+                hostname = os.uname().nodename
+                emoji = "✅" if ok else "❌"
+                _send_telegram(f"{emoji} <b>[{hostname}] {cmd}</b>\n{detail}")
+        except Exception as e:
+            print(f"  [Telegram] 轮询异常: {e}")
+            time.sleep(5)
+
+
+def _start_telegram_polling():
+    """如果配置了 Telegram，启动后台命令轮询线程（仅启动一次）。"""
+    global _tg_poll_started
+    token, chat_id = _load_telegram_config()
+    if not token or not chat_id:
+        return
+    with _tg_poll_lock:
+        if _tg_poll_started:
+            return
+        threading.Thread(target=_tg_poll_loop, daemon=True).start()
+        _tg_poll_started = True
+
+
 _last_unlock_notify: float = 0.0     # 上次发送解锁通知的时间
 _last_lock_notify: float = 0.0       # 上次发送锁屏通知的时间
 _last_wake_notify: float = 0.0       # 上次发送唤醒通知的时间
@@ -297,6 +401,8 @@ def _start_monitor():
     print(f"Login monitor started (PID: {os.getpid()})")
     print(f"Log file: {LOG_FILE}")
     print("Listening for authentication events... (Ctrl+C to stop)")
+
+    _start_telegram_polling()
 
     cmd = ["log", "stream", "--predicate", LOG_PREDICATE, "--style", "compact", "--level", "debug"]
 
@@ -635,6 +741,21 @@ def _mt_executable() -> str:
 
 
 def _install_launchdaemon():
+    if os.geteuid() != 0:
+        print("Error: install 需要 sudo 权限。", file=sys.stderr)
+        sys.exit(1)
+
+    # 找到调用 sudo 的真实用户（root 自身的 HOME=/var/root 不能用，否则
+    # 找不到 ~/.mac-toolbox/config.json，Telegram 通知与命令通道都会失效）。
+    sudo_user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+    if not sudo_user or sudo_user == "root":
+        print("Error: 无法识别调用 sudo 的用户，请用普通用户身份运行 sudo mt monitor install。", file=sys.stderr)
+        sys.exit(1)
+    import pwd
+    user_home = pwd.getpwnam(sudo_user).pw_dir
+    user_data_dir = Path(user_home) / ".mac-toolbox" / "monitor"
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+
     mt = _mt_executable()
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -648,28 +769,31 @@ def _install_launchdaemon():
         <string>monitor</string>
         <string>start</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{user_home}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{DATA_DIR}/launchd.out</string>
+    <string>{user_data_dir}/launchd.out</string>
     <key>StandardErrorPath</key>
-    <string>{DATA_DIR}/launchd.err</string>
+    <string>{user_data_dir}/launchd.err</string>
 </dict>
 </plist>
 """
-    if os.geteuid() != 0:
-        print("Error: install 需要 sudo 权限。", file=sys.stderr)
-        sys.exit(1)
-
-    _ensure_data_dir()
     PLIST_PATH.write_text(plist)
     PLIST_PATH.chmod(0o644)
 
+    # 卸载旧的（如果存在），避免新旧并存
+    subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
     subprocess.run(["launchctl", "load", "-w", str(PLIST_PATH)], check=True)
     print(f"已安装并启动 LaunchDaemon: {PLIST_PATH}")
-    print(f"日志: {DATA_DIR}/launchd.out")
+    print(f"使用用户 HOME: {user_home}")
+    print(f"日志: {user_data_dir}/launchd.out")
     print("开机将自动运行，无需 sudo mt monitor start。")
 
 
